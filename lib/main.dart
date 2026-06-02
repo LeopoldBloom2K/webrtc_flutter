@@ -1,8 +1,10 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-import 'call_screen.dart';
+import 'screens/call_main_screen.dart';
 
 void main() {
+  debugPrint('[APP] main() started — debug mode: $kDebugMode');
   runApp(const DeepVoiceApp());
 }
 
@@ -14,13 +16,11 @@ class DeepVoiceApp extends StatelessWidget {
     return MaterialApp(
       title: '딥보이스 보안 통화',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
-        colorScheme: ColorScheme.dark(
-          primary: Colors.indigoAccent,
-          secondary: Colors.cyanAccent,
-        ),
+      theme: ThemeData(
+        useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFFF2F2F7),
       ),
-      home: const CallScreen(),
+      home: const CallMainScreen(),
     );
   }
 }

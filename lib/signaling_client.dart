@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 typedef MessageCallback = void Function(Map<String, dynamic> message);
@@ -39,6 +40,7 @@ class SignalingClient extends AbstractSignalingClient {
 
   Future<void> connect(String url) async {
     _intentionalDisconnect = false;
+    debugPrint('[Signaling] connecting → $url');
     try {
       _channel = WebSocketChannel.connect(Uri.parse(url));
       _subscription = _channel!.stream.listen(
@@ -48,8 +50,10 @@ class SignalingClient extends AbstractSignalingClient {
         cancelOnError: false,
       );
       await _channel!.ready;
+      debugPrint('[Signaling] connected OK');
       onConnected?.call();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[Signaling] connect FAILED: $e');
       await _subscription?.cancel();
       _subscription = null;
       _channel = null;

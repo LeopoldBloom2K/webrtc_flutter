@@ -1,9 +1,14 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/painting.dart' show FontFeature;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'signaling_client.dart';
 import 'webrtc_manager.dart';
+import 'widgets/profile_circle.dart';
 
 // Bug #1: 수신/발신 대기 상태 포함한 완전한 상태머신
 enum CallState { idle, calling, incomingCall, connecting, inCall }
@@ -11,6 +16,7 @@ enum CallState { idle, calling, incomingCall, connecting, inCall }
 class CallScreen extends StatefulWidget {
   const CallScreen({
     super.key,
+    this.name = '',
     AbstractSignalingClient? signalingClient,
     AbstractWebRTCManager? webRTCManager,
     this.initialServerUrl = 'ws://10.0.2.2:8080',
@@ -18,6 +24,7 @@ class CallScreen extends StatefulWidget {
   })  : _signalingClient = signalingClient,
         _webRTCManager = webRTCManager;
 
+  final String name;
   final AbstractSignalingClient? _signalingClient;
   final AbstractWebRTCManager? _webRTCManager;
   final String initialServerUrl;
@@ -30,15 +37,28 @@ class CallScreen extends StatefulWidget {
   State<CallScreen> createState() => _CallScreenState();
 }
 
-class _CallScreenState extends State<CallScreen> {
+class _CallScreenState extends State<CallScreen>
+    with SingleTickerProviderStateMixin {
   late final AbstractSignalingClient _signalingClient;
   late final AbstractWebRTCManager _webRTCManager;
+  late final AnimationController _waveController;
+  late final TextEditingController _serverUrlController;
+  late final TextEditingController _frequencyController;
 
   CallState _callState = CallState.idle;
   bool _serverConnected = false;
   String _statusMessage = '서버에 연결 중...';
+  double _frequency = 440;
+  Timer? _audioStatusTimer;
+  AudioStats? _latestAudioStats;
 
-  late final TextEditingController _serverUrlController;
+  String _callDuration = '00:00';
+  DateTime? _callStartTime;
+  Timer? _callTimer;
+  double _audioAmplitude = 0.0;
+
+  // 통화 중일 때만 파형 활성화
+  bool get _isPowerOn => _callState == CallState.inCall;
 
   @override
   void initState() {
@@ -47,6 +67,11 @@ class _CallScreenState extends State<CallScreen> {
     _webRTCManager = widget._webRTCManager ?? WebRTCManager();
     _serverUrlController =
         TextEditingController(text: widget.initialServerUrl);
+    _frequencyController = TextEditingController(text: '440');
+    _waveController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
     _setupSignalingCallbacks();
     _signalingClient.connect(_serverUrlController.text);
   }
@@ -118,7 +143,6 @@ class _CallScreenState extends State<CallScreen> {
 
     _webRTCManager.onConnectionStateChange = (state) {
       if (!mounted) return;
-      // Bug #4: endCall() 이후 IDLE 상태라면 stale 콜백 무시
       if (_callState == CallState.idle) return;
 
       setState(() {
@@ -133,6 +157,51 @@ class _CallScreenState extends State<CallScreen> {
           default:
             break;
         }
+      });
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _startAudioMonitor();
+        _startCallTimer();
+      }
+    };
+
+    // onConnectionState가 Android에서 발화되지 않는 경우를 대비한 ICE 상태 fallback
+    _webRTCManager.onIceConnectionStateChange = (state) {
+      if (!mounted) return;
+      if (_callState == CallState.idle) return;
+
+      switch (state) {
+        case RTCIceConnectionState.RTCIceConnectionStateConnected:
+        case RTCIceConnectionState.RTCIceConnectionStateCompleted:
+          if (_callState == CallState.connecting) {
+            setState(() {
+              _callState = CallState.inCall;
+              _statusMessage = '통화 중';
+            });
+            _startAudioMonitor();
+            _startCallTimer();
+          }
+        case RTCIceConnectionState.RTCIceConnectionStateFailed:
+          _endCall(sendHangUp: false);
+          setState(() => _statusMessage = 'ICE 연결 실패');
+        case RTCIceConnectionState.RTCIceConnectionStateDisconnected:
+          if (_callState == CallState.inCall) {
+            _endCall(sendHangUp: false);
+            setState(() => _statusMessage = '연결이 끊겼습니다');
+          }
+        default:
+          break;
+      }
+    };
+
+    _webRTCManager.onAudioStatsUpdate = (stats) {
+      if (!mounted) return;
+      // 에뮬레이터는 micLevel=0이므로 수신 패킷량으로 진폭 계산
+      final local = stats.micLevel.clamp(0.0, 1.0);
+      final remote = (stats.receivedDelta / 55.0).clamp(0.0, 1.0);
+      final level = local > 0.01 ? local : remote * 0.75;
+      setState(() {
+        _latestAudioStats = stats;
+        _audioAmplitude = level;
       });
     };
   }
@@ -256,6 +325,40 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
+  // ── 통화 타이머 ──────────────────────────────────────────────────────────
+
+  void _startCallTimer() {
+    _callStartTime = DateTime.now();
+    _callTimer?.cancel();
+    _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) {
+        _callTimer?.cancel();
+        return;
+      }
+      final d = DateTime.now().difference(_callStartTime!);
+      final h = d.inHours;
+      final m = (d.inMinutes % 60).toString().padLeft(2, '0');
+      final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+      setState(() => _callDuration = h > 0 ? '$h:$m:$s' : '$m:$s');
+    });
+  }
+
+  // ── 오디오 상태 모니터링 ─────────────────────────────────────────────────
+
+  void _startAudioMonitor() {
+    _audioStatusTimer?.cancel();
+    _audioStatusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!mounted) {
+        _audioStatusTimer?.cancel();
+        return;
+      }
+      final s = _webRTCManager.getAudioStatus();
+      final local = s.localActive ? 'ACTIVE' : 'INACTIVE';
+      final remote = s.remoteActive ? 'ACTIVE' : 'INACTIVE';
+      debugPrint('[WebRTC Audio Status] Local: $local / Remote: $remote');
+    });
+  }
+
   // ── 통화 종료 ────────────────────────────────────────────────────────────
 
   void _hangUp() => _endCall(sendHangUp: true);
@@ -268,21 +371,31 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   void _endCall({required bool sendHangUp}) {
+    _audioStatusTimer?.cancel();
+    _audioStatusTimer = null;
+    _callTimer?.cancel();
+    _callTimer = null;
     if (sendHangUp) _signalingClient.sendHangUp();
-    _webRTCManager.close(); // Bug #2/#3: isClosed 플래그 선행 세팅 + 올바른 해제 순서
+    _webRTCManager.close();
     if (!mounted) return;
     setState(() {
-      _callState = CallState.idle; // Bug #4: IDLE로 전환해 stale 콜백 차단
+      _callState = CallState.idle;
       _statusMessage = '통화 종료됨';
+      _latestAudioStats = null;
+      _callDuration = '00:00';
+      _audioAmplitude = 0.0;
     });
   }
 
   @override
   void dispose() {
-    // Bug #5: intentionalDisconnect = true → onDisconnected 억제
+    _audioStatusTimer?.cancel();
+    _callTimer?.cancel();
     _signalingClient.disconnect();
     _webRTCManager.close(); // isClosed 중복 호출 안전 처리됨
     _serverUrlController.dispose();
+    _frequencyController.dispose();
+    _waveController.dispose();
     super.dispose();
   }
 
@@ -291,119 +404,234 @@ class _CallScreenState extends State<CallScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A2E),
+      backgroundColor: const Color(0xFFF2F2F7),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF16213E),
-        foregroundColor: Colors.white,
-        title: const Text('딥보이스 보안 통화'),
+        backgroundColor: Colors.white,
+        elevation: 0,
+        shadowColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        foregroundColor: const Color(0xFF111111),
+        title: const Text(
+          '딥보이스 보안 통화',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
         centerTitle: true,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          children: [
-            _buildServerCard(),
-            const SizedBox(height: 32),
-            Expanded(child: _buildStatusSection()),
-            _buildCallControls(),
-            const SizedBox(height: 32),
-          ],
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              _buildServerCard(),
+              const SizedBox(height: 28),
+              const ProfileCircle(),
+              if (widget.name.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Text(
+                  widget.name,
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.w500,
+                    color: Color(0xFF111111),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 10),
+              Text(
+                _statusMessage,
+                style: const TextStyle(
+                  fontSize: 15,
+                  color: Color(0xFF8E8E93),
+                ),
+                textAlign: TextAlign.center,
+              ),
+              if (_callState == CallState.inCall) ...[
+                const SizedBox(height: 6),
+                Text(
+                  _callDuration,
+                  style: const TextStyle(
+                    fontSize: 34,
+                    fontWeight: FontWeight.w200,
+                    color: Color(0xFF111111),
+                    letterSpacing: 4,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
+              if (_callState == CallState.calling ||
+                  _callState == CallState.connecting)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Color(0xFF8E8E93),
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 24),
+              _buildWaveContainer(),
+              const SizedBox(height: 12),
+              _buildFrequencyInput(),
+              if (_callState == CallState.inCall && _latestAudioStats != null) ...[
+                const SizedBox(height: 12),
+                _buildAudioStatsCard(_latestAudioStats!),
+              ],
+              const SizedBox(height: 24),
+              _buildCallControls(),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildServerCard() {
-    return Card(
-      color: const Color(0xFF16213E),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '시그널링 서버',
-              style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: const [
+          BoxShadow(
+            color: Color.fromRGBO(0, 0, 0, 0.06),
+            blurRadius: 10,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '시그널링 서버',
+            style: TextStyle(
+              color: Color(0xFF8E8E93),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
             ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _serverUrlController,
-                    enabled: !_serverConnected,
-                    style: const TextStyle(color: Colors.white, fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: 'ws://10.0.2.2:8080',
-                      hintStyle: const TextStyle(color: Colors.white38),
-                      isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 8),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8)),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: const BorderSide(color: Colors.white24),
-                      ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _serverUrlController,
+                  enabled: !_serverConnected,
+                  style: const TextStyle(
+                      color: Color(0xFF111111), fontSize: 13),
+                  decoration: InputDecoration(
+                    hintText: 'ws://10.0.2.2:8080',
+                    hintStyle:
+                        const TextStyle(color: Color(0xFFB8B8B8)),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8)),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide:
+                          const BorderSide(color: Color(0xFFE0E0E0)),
+                    ),
+                    disabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide:
+                          const BorderSide(color: Color(0xFFE0E0E0)),
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: _serverConnected
-                      ? null
-                      : () => _signalingClient
-                          .connect(_serverUrlController.text),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _serverConnected
-                        ? Colors.green.shade800
-                        : Colors.indigo,
-                    foregroundColor: Colors.white,
-                  ),
-                  child: Text(_serverConnected ? '연결됨' : '연결'),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton(
+                onPressed: _serverConnected
+                    ? null
+                    : () => _signalingClient
+                        .connect(_serverUrlController.text),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF111111),
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: const Color(0xFF34C759),
+                  disabledForegroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8)),
+                  elevation: 0,
                 ),
-              ],
+                child: Text(_serverConnected ? '연결됨' : '연결'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWaveContainer() {
+    return Container(
+      width: double.infinity,
+      height: 120,
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8F8F8),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: const [
+          BoxShadow(
+            color: Color.fromRGBO(0, 0, 0, 0.06),
+            blurRadius: 12,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(24),
+        child: AnimatedBuilder(
+          animation: _waveController,
+          builder: (context, _) => CustomPaint(
+            painter: _WavePainter(
+              isPowerOn: _isPowerOn,
+              frequency: _frequency,
+              phase: _waveController.value * math.pi * 2,
+              audioLevel: _audioAmplitude,
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildStatusSection() {
-    final iconData = _callState == CallState.inCall
-        ? Icons.phone_in_talk
-        : _callState == CallState.incomingCall
-            ? Icons.phone_callback
-            : Icons.phone;
-
-    final iconColor = _callState == CallState.inCall
-        ? Colors.greenAccent
-        : _callState == CallState.incomingCall
-            ? Colors.amberAccent
-            : Colors.white38;
-
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(iconData, size: 96, color: iconColor),
-        const SizedBox(height: 24),
-        if (_callState == CallState.calling ||
-            _callState == CallState.connecting)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 16),
-            child: CircularProgressIndicator(color: Colors.indigoAccent),
+  Widget _buildFrequencyInput() {
+    return Container(
+      width: 160,
+      height: 40,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: const [
+          BoxShadow(
+            color: Color.fromRGBO(0, 0, 0, 0.06),
+            blurRadius: 8,
+            offset: Offset(0, 3),
           ),
-        Text(
-          _statusMessage,
-          style: const TextStyle(
-              color: Colors.white, fontSize: 18, fontWeight: FontWeight.w500),
-          textAlign: TextAlign.center,
+        ],
+      ),
+      child: TextField(
+        controller: _frequencyController,
+        keyboardType: TextInputType.number,
+        textAlign: TextAlign.center,
+        onChanged: (value) {
+          final f = double.tryParse(value);
+          if (f != null) setState(() => _frequency = f);
+        },
+        decoration: const InputDecoration(
+          border: InputBorder.none,
+          suffixText: 'Hz',
+          isDense: true,
+          contentPadding: EdgeInsets.symmetric(vertical: 10),
         ),
-      ],
+      ),
     );
   }
 
@@ -414,19 +642,19 @@ class _CallScreenState extends State<CallScreen> {
             ? _callButton(
                 label: '발신',
                 icon: Icons.phone,
-                color: Colors.green,
+                color: const Color(0xFF34C759),
                 onPressed: _startCall,
               )
-            : Text(
+            : const Text(
                 '서버에 연결 후 통화할 수 있습니다',
-                style: TextStyle(color: Colors.white38),
+                style: TextStyle(color: Color(0xFF8E8E93)),
               );
 
       case CallState.calling:
         return _callButton(
           label: '취소',
           icon: Icons.call_end,
-          color: Colors.orange,
+          color: const Color(0xFFFF9500),
           onPressed: _cancelCall,
         );
 
@@ -438,14 +666,14 @@ class _CallScreenState extends State<CallScreen> {
             _callButton(
               label: '거절',
               icon: Icons.call_end,
-              color: Colors.red,
+              color: const Color(0xFFFF3B30),
               onPressed: _rejectCall,
               width: 140,
             ),
             _callButton(
               label: '받기',
               icon: Icons.phone,
-              color: Colors.green,
+              color: const Color(0xFF34C759),
               onPressed: _acceptCall,
               width: 140,
             ),
@@ -453,9 +681,11 @@ class _CallScreenState extends State<CallScreen> {
         );
 
       case CallState.connecting:
-        return const Text(
-          'WebRTC 연결 협상 중...',
-          style: TextStyle(color: Colors.white54),
+        return _callButton(
+          label: '종료',
+          icon: Icons.call_end,
+          color: const Color(0xFFFF3B30),
+          onPressed: _hangUp,
         );
 
       case CallState.inCall:
@@ -463,10 +693,63 @@ class _CallScreenState extends State<CallScreen> {
         return _callButton(
           label: 'Hang Up',
           icon: Icons.call_end,
-          color: Colors.red,
+          color: const Color(0xFFFF3B30),
           onPressed: _hangUp,
         );
     }
+  }
+
+  Widget _buildAudioStatsCard(AudioStats stats) {
+    final txOk = stats.sentDelta > 0;
+    final rxOk = stats.speakerActive;
+    final borderColor = stats.isStalled
+        ? const Color(0xFFFF3B30)
+        : (txOk || rxOk)
+            ? const Color(0xFF34C759)
+            : const Color(0xFFFF9500);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1C1E),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: borderColor, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '🎤 Mic: ${stats.micLevel.toStringAsFixed(4)}  📤 Sent: +${stats.sentDelta} pkts',
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: txOk ? const Color(0xFF34C759) : const Color(0xFFFF9500),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '🔊 ${stats.speakerActive ? "ACTIVE" : "SILENT"}  📥 Recv: +${stats.receivedDelta} pkts  +${stats.bytesReceivedDelta} B',
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: rxOk ? const Color(0xFF34C759) : const Color(0xFFFF3B30),
+            ),
+          ),
+          if (stats.isStalled) ...[
+            const SizedBox(height: 4),
+            const Text(
+              '⚠️  STALL: 패킷 미흐름 — 마이크 권한/ICE 확인',
+              style: TextStyle(
+                fontSize: 11,
+                fontFamily: 'monospace',
+                color: Color(0xFFFF3B30),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   Widget _callButton({
@@ -486,10 +769,77 @@ class _CallScreenState extends State<CallScreen> {
         style: ElevatedButton.styleFrom(
           backgroundColor: color,
           foregroundColor: Colors.white,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(28)),
+          elevation: 0,
         ),
       ),
     );
   }
+}
+
+class _WavePainter extends CustomPainter {
+  const _WavePainter({
+    required this.isPowerOn,
+    required this.frequency,
+    required this.phase,
+    this.audioLevel = 0.0,
+  });
+
+  final bool isPowerOn;
+  final double frequency;
+  final double phase;
+  final double audioLevel;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color =
+          isPowerOn ? Colors.black : const Color(0xFFC7C7CC)
+      ..strokeWidth = isPowerOn ? 3 : 2
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    final path = Path();
+
+    if (!isPowerOn) {
+      const idleAmplitude = 8.0;
+      const idleWaveCount = 3.0;
+      for (double x = 0; x <= size.width; x++) {
+        final y = size.height / 2 +
+            math.sin((x / size.width) * math.pi * idleWaveCount) *
+                idleAmplitude;
+        if (x == 0) {
+          path.moveTo(x, y);
+        } else {
+          path.lineTo(x, y);
+        }
+      }
+    } else {
+      final waveCount = (frequency / 100).clamp(2.0, 12.0);
+      // audioLevel=0 → 8px(무음), audioLevel=1 → 42px(최대)
+      final amplitude = 8.0 + audioLevel * 34.0;
+
+      for (double x = 0; x <= size.width; x++) {
+        final y = size.height / 2 +
+            math.sin(
+                    (x / size.width) * math.pi * waveCount + phase) *
+                amplitude;
+        if (x == 0) {
+          path.moveTo(x, y);
+        } else {
+          path.lineTo(x, y);
+        }
+      }
+    }
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _WavePainter oldDelegate) =>
+      oldDelegate.isPowerOn != isPowerOn ||
+      oldDelegate.frequency != frequency ||
+      oldDelegate.phase != phase ||
+      oldDelegate.audioLevel != audioLevel;
 }

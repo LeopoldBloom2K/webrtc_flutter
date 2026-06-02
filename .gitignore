@@ -57,12 +57,26 @@ server/npm-debug.log*
 server/yarn-debug.log*
 server/yarn-error.log*
 server/.env
+server/*.log
+server/*.log.*
 
 # Unused platforms (linux/macos/web not targeted)
 # To enable: remove the relevant line below
 /linux/
 /macos/
 /web/
+
+# Archives & old copies
+*.zip
+capstone_call_app/
+
+# Development screenshots
+screen*.png
+callscreen.png
+final.png
+
+# IDE / design files
+ui.xml
 
 # Claude Code
 .claude/
