@@ -11,6 +11,7 @@ import 'webrtc_manager.dart';
 import 'vocalcrypt_service.dart';
 import 'widgets/profile_circle.dart';
 
+// Bug #1: 수신/발신 대기 상태 포함한 완전한 상태머신
 enum CallState { idle, calling, incomingCall, connecting, inCall }
 
 class CallScreen extends StatefulWidget {
@@ -28,6 +29,9 @@ class CallScreen extends StatefulWidget {
   final AbstractSignalingClient? _signalingClient;
   final AbstractWebRTCManager? _webRTCManager;
   final String initialServerUrl;
+
+  /// 테스트에서 permission_handler 플러그인 없이 권한 결과를 주입한다.
+  /// null이면 실제 Permission.microphone.request()를 사용한다.
   final Future<bool> Function()? microphonePermissionChecker;
 
   @override
@@ -35,37 +39,29 @@ class CallScreen extends StatefulWidget {
 }
 
 class _CallScreenState extends State<CallScreen>
-    with SingleTickerProviderStateMixin {
+{
   late final AbstractSignalingClient _signalingClient;
   late final AbstractWebRTCManager _webRTCManager;
-  late final AnimationController _waveController;
   late final TextEditingController _serverUrlController;
-  late final TextEditingController _frequencyController;
 
   CallState _callState = CallState.idle;
+
+  // VocalCrypt 상태
+  VocalCryptStatus _vcStatus = VocalCryptStatus.idle;
+  String _vcMessage = '';
   bool _serverConnected = false;
   String _statusMessage = '서버에 연결 중...';
-  double _frequency = 440;
   Timer? _audioStatusTimer;
   AudioStats? _latestAudioStats;
 
   String _callDuration = '00:00';
   DateTime? _callStartTime;
   Timer? _callTimer;
-  double _audioAmplitude = 0.0;
-
-  // ── VocalCrypt 상태 ─────────────────────────────────────────────────────
-  VocalCryptStatus _vcStatus = VocalCryptStatus.idle;
-  String _vcMessage = '';
-
-  bool get _isPowerOn => _callState == CallState.inCall;
-
+  // 통화 중일 때만 파형 활성화
   @override
   void initState() {
     super.initState();
     _signalingClient = widget._signalingClient ?? SignalingClient();
-
-    // VocalCryptService를 주입한 WebRTCManager 생성
     _webRTCManager = widget._webRTCManager ?? WebRTCManager(
       vocalCryptService: VocalCryptService(
         serverUrl: 'http://10.0.2.2:8765',
@@ -73,19 +69,13 @@ class _CallScreenState extends State<CallScreen>
       ),
       vocalCryptEnabled: true,
     );
-
     _serverUrlController =
         TextEditingController(text: widget.initialServerUrl);
-    _frequencyController = TextEditingController(text: '440');
-    _waveController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    )..repeat();
     _setupSignalingCallbacks();
     _signalingClient.connect(_serverUrlController.text);
   }
 
-  // ── 시그널링 콜백 ────────────────────────────────────────────────────────
+  // ── 시그널링 콜백 설정 ──────────────────────────────────────────────────
 
   void _setupSignalingCallbacks() {
     _signalingClient.onConnected = () {
@@ -96,6 +86,8 @@ class _CallScreenState extends State<CallScreen>
       });
     };
 
+    // Bug #5 대응: SignalingClient 내부의 intentionalDisconnect 플래그가
+    //   dispose() 시점 콜백을 억제하므로, 여기서는 mounted 체크만 추가.
     _signalingClient.onDisconnected = () {
       if (!mounted) return;
       _webRTCManager.close();
@@ -129,7 +121,7 @@ class _CallScreenState extends State<CallScreen>
     };
   }
 
-  // ── WebRTC 콜백 ──────────────────────────────────────────────────────────
+  // ── WebRTC 콜백 설정 ────────────────────────────────────────────────────
 
   void _setupWebRTCCallbacks() {
     _webRTCManager.onIceCandidate = (candidate) {
@@ -151,6 +143,7 @@ class _CallScreenState extends State<CallScreen>
     _webRTCManager.onConnectionStateChange = (state) {
       if (!mounted) return;
       if (_callState == CallState.idle) return;
+
       setState(() {
         switch (state) {
           case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
@@ -170,9 +163,11 @@ class _CallScreenState extends State<CallScreen>
       }
     };
 
+    // onConnectionState가 Android에서 발화되지 않는 경우를 대비한 ICE 상태 fallback
     _webRTCManager.onIceConnectionStateChange = (state) {
       if (!mounted) return;
       if (_callState == CallState.idle) return;
+
       switch (state) {
         case RTCIceConnectionState.RTCIceConnectionStateConnected:
         case RTCIceConnectionState.RTCIceConnectionStateCompleted:
@@ -199,12 +194,8 @@ class _CallScreenState extends State<CallScreen>
 
     _webRTCManager.onAudioStatsUpdate = (stats) {
       if (!mounted) return;
-      final local = stats.micLevel.clamp(0.0, 1.0);
-      final remote = (stats.receivedDelta / 55.0).clamp(0.0, 1.0);
-      final level = local > 0.01 ? local : remote * 0.75;
       setState(() {
         _latestAudioStats = stats;
-        _audioAmplitude = level;
       });
     };
 
@@ -218,8 +209,20 @@ class _CallScreenState extends State<CallScreen>
     };
   }
 
-  // ── 발신 ────────────────────────────────────────────────────────────────
+  // ── VocalCrypt 보호 실행 ─────────────────────────────────────────────────
+  Future<void> _runVocalCrypt() async {
+    final result = await _webRTCManager.captureAndProtect(durationSeconds: 3);
+    if (result == null && mounted) {
+      setState(() {
+        _vcStatus = VocalCryptStatus.error;
+        _vcMessage = 'VocalCrypt를 지원하지 않는 환경입니다';
+      });
+    }
+  }
 
+  // ── 발신 흐름 ───────────────────────────────────────────────────────────
+
+  // Bug #1: CALLING 상태 + call_request 전송
   void _startCall() {
     setState(() {
       _callState = CallState.calling;
@@ -237,6 +240,7 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Future<void> _onCallAccepted() async {
+    // Bug #6: call_accept 수신 시 먼저 CONNECTING으로 전환 후 offer 생성
     if (!mounted || _callState != CallState.calling) return;
     setState(() {
       _callState = CallState.connecting;
@@ -255,8 +259,9 @@ class _CallScreenState extends State<CallScreen>
     });
   }
 
-  // ── 수신 ────────────────────────────────────────────────────────────────
+  // ── 수신 흐름 ───────────────────────────────────────────────────────────
 
+  // Bug #1: INCOMING_CALL 상태 UI 진입
   void _onCallRequest() {
     if (!mounted || _callState != CallState.idle) return;
     setState(() {
@@ -312,7 +317,7 @@ class _CallScreenState extends State<CallScreen>
     await _webRTCManager.initialize();
   }
 
-  // ── SDP / ICE ────────────────────────────────────────────────────────────
+  // ── SDP / ICE 수신 ──────────────────────────────────────────────────────
 
   Future<void> _onOffer(String sdp) async {
     if (_callState != CallState.connecting) return;
@@ -334,13 +339,16 @@ class _CallScreenState extends State<CallScreen>
     );
   }
 
-  // ── 타이머 / 모니터링 ─────────────────────────────────────────────────────
+  // ── 통화 타이머 ──────────────────────────────────────────────────────────
 
   void _startCallTimer() {
     _callStartTime = DateTime.now();
     _callTimer?.cancel();
     _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) { _callTimer?.cancel(); return; }
+      if (!mounted) {
+        _callTimer?.cancel();
+        return;
+      }
       final d = DateTime.now().difference(_callStartTime!);
       final h = d.inHours;
       final m = (d.inMinutes % 60).toString().padLeft(2, '0');
@@ -349,12 +357,19 @@ class _CallScreenState extends State<CallScreen>
     });
   }
 
+  // ── 오디오 상태 모니터링 ─────────────────────────────────────────────────
+
   void _startAudioMonitor() {
     _audioStatusTimer?.cancel();
     _audioStatusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (!mounted) { _audioStatusTimer?.cancel(); return; }
+      if (!mounted) {
+        _audioStatusTimer?.cancel();
+        return;
+      }
       final s = _webRTCManager.getAudioStatus();
-      debugPrint('[Audio] Local:${s.localActive} Remote:${s.remoteActive}');
+      final local = s.localActive ? 'ACTIVE' : 'INACTIVE';
+      final remote = s.remoteActive ? 'ACTIVE' : 'INACTIVE';
+      debugPrint('[WebRTC Audio Status] Local: $local / Remote: $remote');
     });
   }
 
@@ -365,6 +380,7 @@ class _CallScreenState extends State<CallScreen>
   void _onRemoteHangUp() {
     if (!mounted) return;
     _endCall(sendHangUp: false);
+    // setState는 _endCall 내부에서 호출하므로 추가 setState 없이 덮어쓰기
     setState(() => _statusMessage = '상대방이 통화를 종료했습니다');
   }
 
@@ -381,22 +397,7 @@ class _CallScreenState extends State<CallScreen>
       _statusMessage = '통화 종료됨';
       _latestAudioStats = null;
       _callDuration = '00:00';
-      _audioAmplitude = 0.0;
-      _vcStatus = VocalCryptStatus.idle;
-      _vcMessage = '';
     });
-  }
-
-  // ── VocalCrypt 보호 실행 ─────────────────────────────────────────────────
-
-  Future<void> _runVocalCrypt() async {
-    final result = await _webRTCManager.captureAndProtect(durationSeconds: 3);
-    if (result == null && mounted) {
-      setState(() {
-        _vcStatus = VocalCryptStatus.error;
-        _vcMessage = 'VocalCrypt를 지원하지 않는 환경입니다';
-      });
-    }
   }
 
   @override
@@ -404,10 +405,8 @@ class _CallScreenState extends State<CallScreen>
     _audioStatusTimer?.cancel();
     _callTimer?.cancel();
     _signalingClient.disconnect();
-    _webRTCManager.close();
+    _webRTCManager.close(); // isClosed 중복 호출 안전 처리됨
     _serverUrlController.dispose();
-    _frequencyController.dispose();
-    _waveController.dispose();
     super.dispose();
   }
 
@@ -431,18 +430,14 @@ class _CallScreenState extends State<CallScreen>
       ),
       body: SingleChildScrollView(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
+          padding: const EdgeInsets.fromLTRB(20, 32, 20, 32),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              _buildServerCard(),
-              const SizedBox(height: 16),
-              // ── VocalCrypt 보호 카드 ──────────────────────────────────
-              _buildVocalCryptCard(),
-              const SizedBox(height: 20),
+              // ── 1. 프로필 + 이름 ─────────────────────────
               const ProfileCircle(),
-              if (widget.name.isNotEmpty) ...[
-                const SizedBox(height: 16),
+              const SizedBox(height: 16),
+              if (widget.name.isNotEmpty)
                 Text(
                   widget.name,
                   style: const TextStyle(
@@ -451,11 +446,13 @@ class _CallScreenState extends State<CallScreen>
                     color: Color(0xFF111111),
                   ),
                 ),
-              ],
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               Text(
                 _statusMessage,
-                style: const TextStyle(fontSize: 15, color: Color(0xFF8E8E93)),
+                style: const TextStyle(
+                  fontSize: 15,
+                  color: Color(0xFF8E8E93),
+                ),
                 textAlign: TextAlign.center,
               ),
               if (_callState == CallState.inCall) ...[
@@ -476,22 +473,27 @@ class _CallScreenState extends State<CallScreen>
                 const Padding(
                   padding: EdgeInsets.only(top: 8),
                   child: SizedBox(
-                    width: 16, height: 16,
+                    width: 16,
+                    height: 16,
                     child: CircularProgressIndicator(
-                      strokeWidth: 2, color: Color(0xFF8E8E93),
+                      strokeWidth: 2,
+                      color: Color(0xFF8E8E93),
                     ),
                   ),
                 ),
-              const SizedBox(height: 24),
-              _buildWaveContainer(),
+              const SizedBox(height: 32),
+              // ── 2. 시그널링 서버 카드 ──────────────────────
+              _buildServerCard(),
               const SizedBox(height: 12),
-              _buildFrequencyInput(),
+              // ── 3. 딥보이스 보호 카드 ──────────────────────
+              _buildVocalCryptCard(),
+              const SizedBox(height: 100),
+              // ── 4. 발신/수신/종료 버튼 ─────────────────────
+              _buildCallControls(),
               if (_callState == CallState.inCall && _latestAudioStats != null) ...[
-                const SizedBox(height: 12),
+                const SizedBox(height: 16),
                 _buildAudioStatsCard(_latestAudioStats!),
               ],
-              const SizedBox(height: 24),
-              _buildCallControls(),
             ],
           ),
         ),
@@ -499,8 +501,152 @@ class _CallScreenState extends State<CallScreen>
     );
   }
 
-  // ── VocalCrypt 카드 위젯 ─────────────────────────────────────────────────
+  Widget _buildServerCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: const [
+          BoxShadow(
+            color: Color.fromRGBO(0, 0, 0, 0.06),
+            blurRadius: 10,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '시그널링 서버',
+            style: TextStyle(
+              color: Color(0xFF8E8E93),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _serverUrlController,
+                  enabled: !_serverConnected,
+                  style: const TextStyle(
+                      color: Color(0xFF111111), fontSize: 13),
+                  decoration: InputDecoration(
+                    hintText: 'ws://10.0.2.2:8080',
+                    hintStyle:
+                    const TextStyle(color: Color(0xFFB8B8B8)),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8)),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide:
+                      const BorderSide(color: Color(0xFFE0E0E0)),
+                    ),
+                    disabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide:
+                      const BorderSide(color: Color(0xFFE0E0E0)),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton(
+                onPressed: _serverConnected
+                    ? null
+                    : () => _signalingClient
+                    .connect(_serverUrlController.text),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF111111),
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: const Color(0xFF34C759),
+                  disabledForegroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8)),
+                  elevation: 0,
+                ),
+                child: Text(_serverConnected ? '연결됨' : '연결'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
 
+
+  Widget _buildCallControls() {
+    switch (_callState) {
+      case CallState.idle:
+        return _serverConnected
+            ? _callButton(
+          label: '발신',
+          icon: Icons.phone,
+          color: const Color(0xFF34C759),
+          onPressed: _startCall,
+        )
+            : const Text(
+          '서버에 연결 후 통화할 수 있습니다',
+          style: TextStyle(color: Color(0xFF8E8E93)),
+        );
+
+      case CallState.calling:
+        return _callButton(
+          label: '취소',
+          icon: Icons.call_end,
+          color: const Color(0xFFFF9500),
+          onPressed: _cancelCall,
+        );
+
+      case CallState.incomingCall:
+      // Bug #1: 수신 UI — 받기 / 거절
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _callButton(
+              label: '거절',
+              icon: Icons.call_end,
+              color: const Color(0xFFFF3B30),
+              onPressed: _rejectCall,
+              width: 140,
+            ),
+            _callButton(
+              label: '받기',
+              icon: Icons.phone,
+              color: const Color(0xFF34C759),
+              onPressed: _acceptCall,
+              width: 140,
+            ),
+          ],
+        );
+
+      case CallState.connecting:
+        return _callButton(
+          label: '종료',
+          icon: Icons.call_end,
+          color: const Color(0xFFFF3B30),
+          onPressed: _hangUp,
+        );
+
+      case CallState.inCall:
+      // Bug #1: Hang Up 버튼
+        return _callButton(
+          label: 'Hang Up',
+          icon: Icons.call_end,
+          color: const Color(0xFFFF3B30),
+          onPressed: _hangUp,
+        );
+    }
+  }
+
+  // ── VocalCrypt 카드 ─────────────────────────────────────────────────────
   Widget _buildVocalCryptCard() {
     final Color color;
     final Color bgColor;
@@ -534,7 +680,7 @@ class _CallScreenState extends State<CallScreen>
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
         color: bgColor,
         borderRadius: BorderRadius.circular(16),
@@ -584,258 +730,53 @@ class _CallScreenState extends State<CallScreen>
                     ),
                   ],
                 ),
-                if (_vcMessage.isNotEmpty) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    _vcMessage,
-                    style: const TextStyle(
-                        fontSize: 11, color: Color(0xFF8E8E93)),
+                const SizedBox(height: 2),
+                Text(
+                  _vcMessage.isNotEmpty
+                      ? _vcMessage
+                      : _vcStatus == VocalCryptStatus.idle
+                      ? '통화 전 음성을 보호하세요'
+                      : _vcStatus == VocalCryptStatus.done
+                      ? '음성 보호 완료'
+                      : '',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF8E8E93),
                   ),
-                ] else ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    _vcStatus == VocalCryptStatus.idle
-                        ? '통화 전 음성을 보호하세요'
-                        : _vcStatus == VocalCryptStatus.done
-                        ? '음성 보호 완료'
-                        : '',
-                    style: const TextStyle(
-                        fontSize: 11, color: Color(0xFF8E8E93)),
-                  ),
-                ],
+                ),
               ],
             ),
           ),
           const SizedBox(width: 8),
           if (isRunning)
             SizedBox(
-              width: 20, height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2, color: color),
+              width: 20,
+              height: 20,
+              child:
+              CircularProgressIndicator(strokeWidth: 2, color: color),
             )
           else
             TextButton(
               onPressed: _serverConnected ? _runVocalCrypt : null,
               style: TextButton.styleFrom(
                 foregroundColor: color,
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 12, vertical: 6),
+                padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                 minimumSize: Size.zero,
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
               child: Text(
                 _vcStatus == VocalCryptStatus.done ? '재보호' : '시작',
                 style: TextStyle(
-                    fontSize: 13, fontWeight: FontWeight.w600, color: color),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  // ── 기존 위젯들 (변경 없음) ───────────────────────────────────────────────
-
-  Widget _buildServerCard() {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
-          BoxShadow(
-            color: Color.fromRGBO(0, 0, 0, 0.06),
-            blurRadius: 10,
-            offset: Offset(0, 3),
-          ),
-        ],
-      ),
-      padding: const EdgeInsets.all(14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            '시그널링 서버',
-            style: TextStyle(
-              color: Color(0xFF8E8E93),
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _serverUrlController,
-                  enabled: !_serverConnected,
-                  style: const TextStyle(
-                      color: Color(0xFF111111), fontSize: 13),
-                  decoration: InputDecoration(
-                    hintText: 'ws://10.0.2.2:8080',
-                    hintStyle: const TextStyle(color: Color(0xFFB8B8B8)),
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 8),
-                    border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8)),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide:
-                      const BorderSide(color: Color(0xFFE0E0E0)),
-                    ),
-                    disabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide:
-                      const BorderSide(color: Color(0xFFE0E0E0)),
-                    ),
-                  ),
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: _serverConnected ? color : const Color(0xFFB8B8B8),
                 ),
               ),
-              const SizedBox(width: 8),
-              ElevatedButton(
-                onPressed: _serverConnected
-                    ? null
-                    : () => _signalingClient
-                    .connect(_serverUrlController.text),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF111111),
-                  foregroundColor: Colors.white,
-                  disabledBackgroundColor: const Color(0xFF34C759),
-                  disabledForegroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8)),
-                  elevation: 0,
-                ),
-                child: Text(_serverConnected ? '연결됨' : '연결'),
-              ),
-            ],
-          ),
+            ),
         ],
       ),
     );
-  }
-
-  Widget _buildWaveContainer() {
-    return Container(
-      width: double.infinity,
-      height: 120,
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8F8F8),
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: const [
-          BoxShadow(
-            color: Color.fromRGBO(0, 0, 0, 0.06),
-            blurRadius: 12,
-            offset: Offset(0, 4),
-          ),
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(24),
-        child: AnimatedBuilder(
-          animation: _waveController,
-          builder: (context, _) => CustomPaint(
-            painter: _WavePainter(
-              isPowerOn: _isPowerOn,
-              frequency: _frequency,
-              phase: _waveController.value * math.pi * 2,
-              audioLevel: _audioAmplitude,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFrequencyInput() {
-    return Container(
-      width: 160,
-      height: 40,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: const [
-          BoxShadow(
-            color: Color.fromRGBO(0, 0, 0, 0.06),
-            blurRadius: 8,
-            offset: Offset(0, 3),
-          ),
-        ],
-      ),
-      child: TextField(
-        controller: _frequencyController,
-        keyboardType: TextInputType.number,
-        textAlign: TextAlign.center,
-        onChanged: (value) {
-          final f = double.tryParse(value);
-          if (f != null) setState(() => _frequency = f);
-        },
-        decoration: const InputDecoration(
-          border: InputBorder.none,
-          suffixText: 'Hz',
-          isDense: true,
-          contentPadding: EdgeInsets.symmetric(vertical: 10),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCallControls() {
-    switch (_callState) {
-      case CallState.idle:
-        return _serverConnected
-            ? _callButton(
-          label: '발신',
-          icon: Icons.phone,
-          color: const Color(0xFF34C759),
-          onPressed: _startCall,
-        )
-            : const Text(
-          '서버에 연결 후 통화할 수 있습니다',
-          style: TextStyle(color: Color(0xFF8E8E93)),
-        );
-      case CallState.calling:
-        return _callButton(
-          label: '취소',
-          icon: Icons.call_end,
-          color: const Color(0xFFFF9500),
-          onPressed: _cancelCall,
-        );
-      case CallState.incomingCall:
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            _callButton(
-              label: '거절',
-              icon: Icons.call_end,
-              color: const Color(0xFFFF3B30),
-              onPressed: _rejectCall,
-              width: 140,
-            ),
-            _callButton(
-              label: '받기',
-              icon: Icons.phone,
-              color: const Color(0xFF34C759),
-              onPressed: _acceptCall,
-              width: 140,
-            ),
-          ],
-        );
-      case CallState.connecting:
-        return _callButton(
-          label: '종료',
-          icon: Icons.call_end,
-          color: const Color(0xFFFF3B30),
-          onPressed: _hangUp,
-        );
-      case CallState.inCall:
-        return _callButton(
-          label: 'Hang Up',
-          icon: Icons.call_end,
-          color: const Color(0xFFFF3B30),
-          onPressed: _hangUp,
-        );
-    }
   }
 
   Widget _buildAudioStatsCard(AudioStats stats) {
@@ -863,9 +804,7 @@ class _CallScreenState extends State<CallScreen>
             style: TextStyle(
               fontSize: 11,
               fontFamily: 'monospace',
-              color: txOk
-                  ? const Color(0xFF34C759)
-                  : const Color(0xFFFF9500),
+              color: txOk ? const Color(0xFF34C759) : const Color(0xFFFF9500),
             ),
           ),
           const SizedBox(height: 4),
@@ -874,9 +813,7 @@ class _CallScreenState extends State<CallScreen>
             style: TextStyle(
               fontSize: 11,
               fontFamily: 'monospace',
-              color: rxOk
-                  ? const Color(0xFF34C759)
-                  : const Color(0xFFFF3B30),
+              color: rxOk ? const Color(0xFF34C759) : const Color(0xFFFF3B30),
             ),
           ),
           if (stats.isStalled) ...[
@@ -921,8 +858,6 @@ class _CallScreenState extends State<CallScreen>
   }
 }
 
-// ── WavePainter (변경 없음) ──────────────────────────────────────────────────
-
 class _WavePainter extends CustomPainter {
   const _WavePainter({
     required this.isPowerOn,
@@ -939,12 +874,14 @@ class _WavePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = isPowerOn ? Colors.black : const Color(0xFFC7C7CC)
+      ..color =
+      isPowerOn ? Colors.black : const Color(0xFFC7C7CC)
       ..strokeWidth = isPowerOn ? 3 : 2
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
     final path = Path();
+
     if (!isPowerOn) {
       const idleAmplitude = 8.0;
       const idleWaveCount = 3.0;
@@ -952,18 +889,30 @@ class _WavePainter extends CustomPainter {
         final y = size.height / 2 +
             math.sin((x / size.width) * math.pi * idleWaveCount) *
                 idleAmplitude;
-        x == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+        if (x == 0) {
+          path.moveTo(x, y);
+        } else {
+          path.lineTo(x, y);
+        }
       }
     } else {
       final waveCount = (frequency / 100).clamp(2.0, 12.0);
+      // audioLevel=0 → 8px(무음), audioLevel=1 → 42px(최대)
       final amplitude = 8.0 + audioLevel * 34.0;
+
       for (double x = 0; x <= size.width; x++) {
         final y = size.height / 2 +
-            math.sin((x / size.width) * math.pi * waveCount + phase) *
+            math.sin(
+                (x / size.width) * math.pi * waveCount + phase) *
                 amplitude;
-        x == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+        if (x == 0) {
+          path.moveTo(x, y);
+        } else {
+          path.lineTo(x, y);
+        }
       }
     }
+
     canvas.drawPath(path, paint);
   }
 
