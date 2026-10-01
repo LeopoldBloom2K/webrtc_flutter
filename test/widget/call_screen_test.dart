@@ -1,15 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:webrtc_flutter/call_screen.dart';
+import 'package:webrtc_flutter/webrtc_manager.dart' show AudioStats;
 
+import '../mocks/mock_audio_relay.dart';
 import '../mocks/mock_signaling_client.dart';
 import '../mocks/mock_webrtc_manager.dart';
 
 Widget _buildTestApp(Widget child) => MaterialApp(home: child);
 
+/// 화면이 만든 음성 중계 Mock. 테스트마다 setUp 에서 비운다.
+final List<MockAudioRelay> relays = [];
+
+/// true 면 다음에 만들어지는 음성 중계의 start() 가 실패한다.
+bool failRelayStart = false;
+
 /// Mock을 주입한 CallScreen.
 /// microphonePermissionChecker를 통해 permission_handler 플러그인 호출 우회.
+/// audioRelayFactory를 통해 마이크·재생·소켓 없이 음성 중계를 대체.
 CallScreen _makeScreen({
   required MockSignalingClient signalingClient,
   required MockWebRTCManager webRTCManager,
@@ -20,6 +28,11 @@ CallScreen _makeScreen({
       webRTCManager: webRTCManager,
       initialServerUrl: 'ws://test:8080',
       microphonePermissionChecker: () async => micGranted,
+      audioRelayFactory: (url, sessionId, role) {
+        final r = MockAudioRelay(url, sessionId, role, failStart: failRelayStart);
+        relays.add(r);
+        return r;
+      },
     );
 
 /// CircularProgressIndicator(무한 애니메이션) 때문에 pumpAndSettle은 쓸 수 없다.
@@ -43,7 +56,7 @@ Future<(MockSignalingClient, MockWebRTCManager)> pumpConnected(
   return (sc, wm);
 }
 
-/// 발신 → call_accept → RTCConnected 순서로 IN_CALL 상태까지 진행한다.
+/// 발신 → call_accept → session_start(음성 채널 시작) 순서로 IN_CALL 상태까지 진행한다.
 Future<(MockSignalingClient, MockWebRTCManager)> pumpInCall(
     WidgetTester tester) async {
   final (sc, wm) = await pumpConnected(tester);
@@ -54,14 +67,28 @@ Future<(MockSignalingClient, MockWebRTCManager)> pumpInCall(
   sc.simulateIncomingMessage({'type': 'call_accept'});
   await pumpAsync(tester); // connecting 상태 (spinner) — pumpAndSettle 불가
 
-  wm.simulateConnectionState(
-      RTCPeerConnectionState.RTCPeerConnectionStateConnected);
-  await tester.pump();
+  sc.simulateIncomingMessage(
+      {'type': 'session_start', 'session_id': 's1', 'role': 'caller'});
+  await pumpAsync(tester);
 
   return (sc, wm);
 }
 
+const _stats = AudioStats(
+  micLevel: 0.05,
+  sentDelta: 10,
+  receivedDelta: 10,
+  bytesReceivedDelta: 32000,
+  speakerActive: true,
+  isStalled: false,
+);
+
 void main() {
+  setUp(() {
+    relays.clear();
+    failRelayStart = false;
+  });
+
   // ─────────────────────────────────────────────
   group('초기 상태 (IDLE + 서버 연결됨)', () {
     testWidgets('앱 제목이 표시된다', (tester) async {
@@ -137,7 +164,7 @@ void main() {
       expect(find.text('발신'), findsOneWidget);
     });
 
-    testWidgets('받기 버튼 탭 → call_accept 전송 + WebRTC initialize 호출',
+    testWidgets('받기 버튼 탭 → call_accept 전송 + CONNECTING (WebRTC 미사용)',
         (tester) async {
       final (sc, wm) = await pumpConnected(tester);
       sc.simulateIncomingMessage({'type': 'call_request'});
@@ -145,70 +172,123 @@ void main() {
       await tester.tap(find.text('받기'));
       await pumpAsync(tester); // connecting 상태 spinner — pumpAndSettle 불가
       expect(sc.sentMessages.any((m) => m['type'] == 'call_accept'), isTrue);
-      expect(wm.initializeCallCount, 1);
+      expect(find.text('종료'), findsOneWidget);
+      expect(wm.initializeCallCount, 0);
     });
   });
 
   // ─────────────────────────────────────────────
   group('Bug #6 — call_accept 수신 시 CONNECTING 전환', () {
-    testWidgets('call_accept 수신 → createOffer 호출 + WebRTC initialized',
+    testWidgets('call_accept 수신 → CONNECTING, 음성 채널은 session_start 까지 대기',
         (tester) async {
       final (sc, wm) = await pumpConnected(tester);
       await tester.tap(find.text('발신'));
       await tester.pump();
       sc.simulateIncomingMessage({'type': 'call_accept'});
       await pumpAsync(tester);
-      expect(wm.offerCreated, isTrue);
-      expect(wm.initializeCallCount, 1);
+      expect(find.text('종료'), findsOneWidget);
+      expect(relays, isEmpty);
+      expect(wm.offerCreated, isFalse);
+      expect(wm.initializeCallCount, 0);
     });
   });
 
   // ─────────────────────────────────────────────
-  group('SDP / ICE 교환', () {
-    testWidgets('offer 수신 → setRemoteDescription + createAnswer 호출',
-        (tester) async {
-      final (sc, wm) = await pumpConnected(tester);
+  group('통화 음성 — 서버 경유 중계', () {
+    testWidgets('발신자: session_start → 음성 채널 시작 + 통화 중', (tester) async {
+      await pumpInCall(tester);
+      expect(relays, hasLength(1));
+      final r = relays.single;
+      expect(r.startCount, 1);
+      expect(r.role, 'caller');
+      expect(r.sessionId, 's1');
+      expect(r.url, Uri.parse('ws://test:8080/audio'));
+      expect(find.text('Hang Up'), findsOneWidget);
+      expect(find.textContaining('통화 중'), findsOneWidget);
+    });
+
+    testWidgets('수신자: 받기 → session_start(callee) → 통화 중', (tester) async {
+      final (sc, _) = await pumpConnected(tester);
       sc.simulateIncomingMessage({'type': 'call_request'});
       await tester.pump();
       await tester.tap(find.text('받기'));
       await pumpAsync(tester);
+      sc.simulateIncomingMessage(
+          {'type': 'session_start', 'session_id': 's2', 'role': 'callee'});
+      await pumpAsync(tester);
+      expect(relays.single.role, 'callee');
+      expect(relays.single.sessionId, 's2');
+      expect(find.text('Hang Up'), findsOneWidget);
+    });
+
+    testWidgets('음성 채널 시작 실패 → hang_up 전송 + IDLE + 안내', (tester) async {
+      failRelayStart = true;
+      final (sc, _) = await pumpInCall(tester);
+      expect(sc.sentMessages.any((m) => m['type'] == 'hang_up'), isTrue);
+      expect(find.text('발신'), findsOneWidget);
+      expect(find.textContaining('음성 채널 연결 실패'), findsOneWidget);
+    });
+
+    testWidgets('통화 중 1초 통계 → 통계 카드 표시', (tester) async {
+      await pumpInCall(tester);
+      relays.single.simulateStats(_stats);
+      await tester.pump();
+      expect(find.textContaining('Sent: +10 pkts'), findsOneWidget);
+      expect(find.textContaining('Recv: +10 pkts'), findsOneWidget);
+    });
+
+    testWidgets('통화 중 음성 채널이 끊김 → hang_up 전송 + IDLE + 안내', (tester) async {
+      final (sc, _) = await pumpInCall(tester);
+      relays.single.simulateClosed('서버 종료');
+      await tester.pump();
+      expect(sc.sentMessages.any((m) => m['type'] == 'hang_up'), isTrue);
+      expect(relays.single.stopCount, 1);
+      expect(find.text('발신'), findsOneWidget);
+      expect(find.textContaining('음성 채널이 끊겼습니다'), findsOneWidget);
+    });
+
+    testWidgets('통화 중에는 단독 보호 버튼(3초 녹음)이 막힌다', (tester) async {
+      final (sc, _) = await pumpConnected(tester);
+      TextButton protectButton() =>
+          tester.widget<TextButton>(find.widgetWithText(TextButton, '시작'));
+      expect(protectButton().onPressed, isNotNull);
+
+      await tester.tap(find.text('발신'));
+      await tester.pump();
+      sc.simulateIncomingMessage({'type': 'call_accept'});
+      await pumpAsync(tester);
+      sc.simulateIncomingMessage(
+          {'type': 'session_start', 'session_id': 's1', 'role': 'caller'});
+      await pumpAsync(tester);
+      expect(protectButton().onPressed, isNull);
+    });
+  });
+
+  // ─────────────────────────────────────────────
+  group('Bug #4 — stale 이벤트 무시', () {
+    testWidgets('IDLE 상태에서 온 session_start 는 무시 (음성 채널 안 열림)',
+        (tester) async {
+      final (sc, _) = await pumpConnected(tester);
+      sc.simulateIncomingMessage(
+          {'type': 'session_start', 'session_id': 'stale', 'role': 'caller'});
+      await pumpAsync(tester);
+      expect(relays, isEmpty);
+      expect(find.text('발신'), findsOneWidget);
+    });
+
+    testWidgets('WebRTC 메시지(offer/answer/ice)는 무시', (tester) async {
+      final (sc, wm) = await pumpConnected(tester);
       sc.simulateIncomingMessage({'type': 'offer', 'sdp': 'v=0\r\nmock'});
+      sc.simulateIncomingMessage({'type': 'answer', 'sdp': 'v=0\r\nmock'});
+      sc.simulateIncomingMessage({
+        'type': 'ice',
+        'candidate': 'candidate:abc',
+        'sdpMid': 'audio',
+        'sdpMLineIndex': 0,
+      });
       await pumpAsync(tester);
-      expect(wm.lastRemoteSdp, 'v=0\r\nmock');
-      expect(wm.lastRemoteSdpType, 'offer');
-      expect(wm.answerCreated, isTrue);
-    });
-
-    testWidgets('createOffer 완료 → sendOffer 호출', (tester) async {
-      final (sc, wm) = await pumpConnected(tester);
-      await tester.tap(find.text('발신'));
-      await tester.pump();
-      sc.simulateIncomingMessage({'type': 'call_accept'});
-      await pumpAsync(tester);
-      expect(sc.sentMessages.any((m) => m['type'] == 'offer'), isTrue);
-    });
-
-    testWidgets('createAnswer 완료 → sendAnswer 호출', (tester) async {
-      final (sc, wm) = await pumpConnected(tester);
-      sc.simulateIncomingMessage({'type': 'call_request'});
-      await tester.pump();
-      await tester.tap(find.text('받기'));
-      await pumpAsync(tester);
-      sc.simulateIncomingMessage({'type': 'offer', 'sdp': 'mock-offer'});
-      await pumpAsync(tester);
-      expect(sc.sentMessages.any((m) => m['type'] == 'answer'), isTrue);
-    });
-  });
-
-  // ─────────────────────────────────────────────
-  group('Bug #4 — stale WebRTC 콜백 무시', () {
-    testWidgets('IDLE 상태에서 RTCConnected 콜백 도착해도 UI 변화 없음',
-        (tester) async {
-      final (_, wm) = await pumpConnected(tester);
-      wm.simulateConnectionState(
-          RTCPeerConnectionState.RTCPeerConnectionStateConnected);
-      await tester.pump();
-      // stale 콜백은 무시 → 여전히 발신 버튼
+      expect(wm.lastRemoteSdp, isNull);
+      expect(wm.answerCreated, isFalse);
       expect(find.text('발신'), findsOneWidget);
     });
   });
@@ -220,22 +300,48 @@ void main() {
       expect(find.text('Hang Up'), findsOneWidget);
     });
 
-    testWidgets('Hang Up 탭 → hang_up 전송 + IDLE 복귀', (tester) async {
-      final (sc, wm) = await pumpInCall(tester);
+    testWidgets('Hang Up 탭 → hang_up 전송 + 음성 채널 정지 + IDLE 복귀',
+        (tester) async {
+      final (sc, _) = await pumpInCall(tester);
       await tester.tap(find.text('Hang Up'));
       await tester.pump();
       expect(sc.sentMessages.any((m) => m['type'] == 'hang_up'), isTrue);
-      expect(wm.closed, isTrue);
+      expect(relays.single.stopCount, 1);
       expect(find.text('발신'), findsOneWidget);
     });
 
-    testWidgets('상대방 hang_up 수신 → IDLE 복귀 + "상대방 종료" 메시지', (tester) async {
-      final (sc, wm) = await pumpInCall(tester);
+    testWidgets('상대방 hang_up 수신 → 음성 채널 정지 + IDLE 복귀 + "상대방 종료" 메시지',
+        (tester) async {
+      final (sc, _) = await pumpInCall(tester);
       sc.simulateIncomingMessage({'type': 'hang_up'});
       await tester.pump();
-      expect(wm.closed, isTrue);
+      expect(relays.single.stopCount, 1);
       expect(find.textContaining('상대방이 통화를 종료'), findsOneWidget);
       expect(find.text('발신'), findsOneWidget);
+    });
+
+    testWidgets('session_end 수신 → 음성 채널 정지 + IDLE 복귀', (tester) async {
+      final (sc, _) = await pumpInCall(tester);
+      sc.simulateIncomingMessage({
+        'type': 'session_end',
+        'session_id': 's1',
+        'reason': 'peer_disconnected',
+      });
+      await tester.pump();
+      expect(relays.single.stopCount, 1);
+      expect(find.text('발신'), findsOneWidget);
+    });
+
+    testWidgets('hang_up 뒤에 오는 session_end 는 안내 문구를 덮지 않음',
+        (tester) async {
+      final (sc, _) = await pumpInCall(tester);
+      sc.simulateIncomingMessage({'type': 'hang_up'});
+      await tester.pump();
+      sc.simulateIncomingMessage(
+          {'type': 'session_end', 'session_id': 's1', 'reason': 'hang_up'});
+      await tester.pump();
+      expect(relays.single.stopCount, 1);
+      expect(find.textContaining('상대방이 통화를 종료'), findsOneWidget);
     });
   });
 
@@ -245,6 +351,14 @@ void main() {
       final (sc, _) = await pumpConnected(tester);
       sc.simulateDisconnect();
       await tester.pump();
+      expect(find.textContaining('서버 연결 끊김'), findsOneWidget);
+    });
+
+    testWidgets('통화 중 시그널링 단절 → 음성 채널 정지', (tester) async {
+      final (sc, _) = await pumpInCall(tester);
+      sc.simulateDisconnect();
+      await tester.pump();
+      expect(relays.single.stopCount, 1);
       expect(find.textContaining('서버 연결 끊김'), findsOneWidget);
     });
 
@@ -293,74 +407,41 @@ void main() {
   });
 
   // ─────────────────────────────────────────────
-  group('ICE candidate 수신 처리', () {
-    testWidgets('ice 메시지 수신 → addIceCandidate 호출 (에러 없음)', (tester) async {
-      final (sc, _) = await pumpConnected(tester);
-      sc.simulateIncomingMessage({
-        'type': 'ice',
-        'candidate': 'candidate:abc',
-        'sdpMid': 'audio',
-        'sdpMLineIndex': 0,
-      });
-      await tester.pump();
-    });
-
-    testWidgets('candidate 필드가 null인 ice 메시지 → 무시됨', (tester) async {
-      final (sc, _) = await pumpConnected(tester);
-      sc.simulateIncomingMessage({
-        'type': 'ice',
-        'sdpMid': 'audio',
-        'sdpMLineIndex': 0,
-      });
-      await tester.pump();
-    });
-  });
-
-  // ─────────────────────────────────────────────
-  group('RTCPeerConnection 상태 전이', () {
-    testWidgets('RTCConnected → inCall 상태, Hang Up 버튼 표시', (tester) async {
-      final (sc, wm) = await pumpConnected(tester);
-      await tester.tap(find.text('발신'));
-      await tester.pump();
-      sc.simulateIncomingMessage({'type': 'call_accept'});
-      await pumpAsync(tester);
-
-      wm.simulateConnectionState(
-          RTCPeerConnectionState.RTCPeerConnectionStateConnected);
-      await tester.pump();
-
-      expect(find.text('Hang Up'), findsOneWidget);
-      expect(find.textContaining('통화 중'), findsOneWidget);
-    });
-
-    testWidgets('RTCFailed → 통화 종료 + IDLE 복귀', (tester) async {
-      final (sc, wm) = await pumpInCall(tester);
-      wm.simulateConnectionState(
-          RTCPeerConnectionState.RTCPeerConnectionStateFailed);
-      await tester.pump();
-      expect(find.text('발신'), findsOneWidget);
-    });
-  });
-
-  // ─────────────────────────────────────────────
   group('마이크 권한 거부', () {
-    testWidgets('권한 거부 시 IDLE로 복귀 + 안내 메시지', (tester) async {
+    testWidgets('발신 시 권한 거부 → call_request 안 보냄 + IDLE + 안내', (tester) async {
       final sc = MockSignalingClient();
       final wm = MockWebRTCManager();
-      await tester.pumpWidget(_buildTestApp(CallScreen(
+      await tester.pumpWidget(_buildTestApp(_makeScreen(
         signalingClient: sc,
         webRTCManager: wm,
-        initialServerUrl: 'ws://test:8080',
-        microphonePermissionChecker: () async => false, // 거부
+        micGranted: false, // 거부
       )));
       await tester.pump();
 
-      // 발신 흐름에서 권한 거부
       await tester.tap(find.text('발신'));
-      await tester.pump();
-      sc.simulateIncomingMessage({'type': 'call_accept'});
       await pumpAsync(tester);
 
+      expect(sc.sentMessages.any((m) => m['type'] == 'call_request'), isFalse);
+      expect(find.text('발신'), findsOneWidget);
+      expect(find.textContaining('마이크 권한'), findsOneWidget);
+    });
+
+    testWidgets('수신 시 권한 거부 → call_reject 전송 + IDLE + 안내', (tester) async {
+      final sc = MockSignalingClient();
+      final wm = MockWebRTCManager();
+      await tester.pumpWidget(_buildTestApp(_makeScreen(
+        signalingClient: sc,
+        webRTCManager: wm,
+        micGranted: false, // 거부
+      )));
+      await tester.pump();
+      sc.simulateIncomingMessage({'type': 'call_request'});
+      await tester.pump();
+      await tester.tap(find.text('받기'));
+      await pumpAsync(tester);
+
+      expect(sc.sentMessages.any((m) => m['type'] == 'call_accept'), isFalse);
+      expect(sc.sentMessages.any((m) => m['type'] == 'call_reject'), isTrue);
       expect(find.text('발신'), findsOneWidget);
       expect(find.textContaining('마이크 권한'), findsOneWidget);
     });

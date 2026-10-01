@@ -59,7 +59,6 @@ server/yarn-error.log*
 server/.env
 server/*.log
 server/*.log.*
-server/tests
 
 # Unused platforms (linux/macos/web not targeted)
 # To enable: remove the relevant line below
@@ -81,3 +80,11 @@ ui.xml
 
 # Claude Code
 .claude/
+
+# Python (server)
+.venv/
+venv/
+
+# Emulator logcat dumps / iOS build cache
+*.logcat
+ios/build/

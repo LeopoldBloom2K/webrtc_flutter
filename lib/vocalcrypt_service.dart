@@ -20,11 +20,27 @@ class VocalCryptResult {
   final String? errorMessage;
   final double? processingTimeMs;
 
+  // 서버가 헤더로 돌려주는 실측값. 기기에서 보호가 실제로 됐는지
+  // 앱이 따로 계산하지 않고 확인하기 위한 것이다.
+  final double? serverSnrDb;
+  final double? serverProcessingMs;
+  final int? serverSampleRate;
+
+  // 입력 자체의 절대 레벨(dBFS). SNR 은 상대값이라 무음이 들어와도 목표치를
+  // 맞추므로, 마이크가 실제로 소리를 잡았는지는 이 값으로만 판단한다.
+  final double? serverInputRmsDbfs;
+  final double? serverInputPeakDbfs;
+
   const VocalCryptResult({
     required this.success,
     this.protectedAudio,
     this.errorMessage,
     this.processingTimeMs,
+    this.serverSnrDb,
+    this.serverProcessingMs,
+    this.serverSampleRate,
+    this.serverInputRmsDbfs,
+    this.serverInputPeakDbfs,
   });
 }
 
@@ -33,7 +49,7 @@ class VocalCryptService {
   final double targetSnr;
 
   const VocalCryptService({
-    this.serverUrl = 'http://10.0.2.2:8765', // Android 에뮬레이터 → 로컬호스트
+    this.serverUrl = 'http://10.0.2.2:8080', // Android 에뮬레이터 → 로컬호스트
     this.targetSnr = 22.0,
   });
 
@@ -79,10 +95,17 @@ class VocalCryptService {
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
 
       if (response.statusCode == 200) {
+        double? head(String k) => double.tryParse(response.headers[k] ?? '');
         return VocalCryptResult(
           success: true,
           protectedAudio: response.bodyBytes,
           processingTimeMs: elapsed.toDouble(),
+          serverSnrDb: head('x-measured-snr'),
+          serverProcessingMs: head('x-processing-ms'),
+          serverSampleRate:
+              int.tryParse(response.headers['x-sample-rate'] ?? ''),
+          serverInputRmsDbfs: head('x-input-rms-dbfs'),
+          serverInputPeakDbfs: head('x-input-peak-dbfs'),
         );
       } else {
         return VocalCryptResult(

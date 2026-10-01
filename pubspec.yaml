@@ -32,9 +32,23 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
-  flutter_webrtc: ^0.11.0
+  flutter_webrtc: ^1.4.1
   web_socket_channel: ^3.0.0
   permission_handler: ^11.3.0
+  record: ^5.1.2                 # 신규: 마이크 녹음
+  http: ^1.2.0                   # 신규: VocalCrypt HTTP
+  path_provider: ^2.1.0          # 신규: 임시 파일 경로
+  flutter_pcm_sound: ^3.3.3      # 통화 음성 재생 (서버가 보낸 상대방 PCM16)
+
+
+# record 5.2.1 은 record_linux 를 '>=0.5.0 <1.0.0' 으로 묶어두는데,
+# 그 범위의 최신인 record_linux 0.7.2 는 record_platform_interface 1.5.0 에서
+# 바뀐 hasPermission() 시그니처와 startStream() 을 따라가지 못합니다.
+# 안드로이드 빌드에서도 dart_plugin_registrant 가 record_linux 를 무조건 import 하므로
+# 컴파일 자체가 실패합니다. 실행에는 쓰이지 않지만 컴파일은 되어야 하므로
+# 유지보수가 이어진 record_linux 1.x 로 올려둡니다.
+dependency_overrides:
+  record_linux: ^1.3.1
 
 dev_dependencies:
   flutter_test:
@@ -88,3 +102,4 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+

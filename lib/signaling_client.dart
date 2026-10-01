@@ -34,10 +34,14 @@ class SignalingClient extends AbstractSignalingClient {
   StreamSubscription? _subscription;
   bool _intentionalDisconnect = false;
 
+  @override
   MessageCallback? onMessage;
+  @override
   VoidCallback? onConnected;
+  @override
   VoidCallback? onDisconnected;
 
+  @override
   Future<void> connect(String url) async {
     _intentionalDisconnect = false;
     debugPrint('[Signaling] connecting → $url');
@@ -84,22 +88,31 @@ class SignalingClient extends AbstractSignalingClient {
   }
 
   // 통화 제어 메시지 (Bug #1: call_request/accept/reject/cancel 추가)
+  @override
   void sendCallRequest() => send({'type': 'call_request'});
+  @override
   void sendCallAccept() => send({'type': 'call_accept'});
+  @override
   void sendCallReject() => send({'type': 'call_reject'});
+  @override
   void sendCallCancel() => send({'type': 'call_cancel'});
+  @override
   void sendHangUp() => send({'type': 'hang_up'});
 
   // WebRTC SDP / ICE 메시지
+  @override
   void sendOffer(String sdp) => send({'type': 'offer', 'sdp': sdp});
+  @override
   void sendAnswer(String sdp) => send({'type': 'answer', 'sdp': sdp});
+  @override
   void sendIce(String candidate, String? sdpMid, int? sdpMLineIndex) => send({
-        'type': 'ice',
-        'candidate': candidate,
-        'sdpMid': sdpMid,
-        'sdpMLineIndex': sdpMLineIndex,
-      });
+    'type': 'ice',
+    'candidate': candidate,
+    'sdpMid': sdpMid,
+    'sdpMLineIndex': sdpMLineIndex,
+  });
 
+  @override
   void disconnect() {
     _intentionalDisconnect = true; // Bug #5: 의도적 종료 표시
     _subscription?.cancel();
