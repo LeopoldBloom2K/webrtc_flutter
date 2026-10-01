@@ -59,6 +59,7 @@ server/yarn-error.log*
 server/.env
 server/*.log
 server/*.log.*
+server/tests
 
 # Unused platforms (linux/macos/web not targeted)
 # To enable: remove the relevant line below

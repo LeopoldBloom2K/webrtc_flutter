@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'signaling_client.dart';
 import 'webrtc_manager.dart';
+import 'vocalcrypt_service.dart';
 import 'widgets/profile_circle.dart';
 
 // Bug #1: 수신/발신 대기 상태 포함한 완전한 상태머신
@@ -38,7 +39,6 @@ class CallScreen extends StatefulWidget {
 }
 
 class _CallScreenState extends State<CallScreen>
-    with SingleTickerProviderStateMixin {
   late final AbstractSignalingClient _signalingClient;
   late final AbstractWebRTCManager _webRTCManager;
   late final AnimationController _waveController;
@@ -46,6 +46,10 @@ class _CallScreenState extends State<CallScreen>
   late final TextEditingController _frequencyController;
 
   CallState _callState = CallState.idle;
+
+  // VocalCrypt 상태
+  VocalCryptStatus _vcStatus = VocalCryptStatus.idle;
+  String _vcMessage = '';
   bool _serverConnected = false;
   String _statusMessage = '서버에 연결 중...';
   double _frequency = 440;
@@ -64,7 +68,6 @@ class _CallScreenState extends State<CallScreen>
   void initState() {
     super.initState();
     _signalingClient = widget._signalingClient ?? SignalingClient();
-    _webRTCManager = widget._webRTCManager ?? WebRTCManager();
     _serverUrlController =
         TextEditingController(text: widget.initialServerUrl);
     _frequencyController = TextEditingController(text: '440');
@@ -204,6 +207,26 @@ class _CallScreenState extends State<CallScreen>
         _audioAmplitude = level;
       });
     };
+
+    // VocalCrypt 상태 콜백
+    _webRTCManager.onVocalCryptStatus = (status, message) {
+      if (!mounted) return;
+      setState(() {
+        _vcStatus = status;
+        _vcMessage = message;
+      });
+    };
+  }
+
+  // ── VocalCrypt 보호 실행 ─────────────────────────────────────────────────
+  Future<void> _runVocalCrypt() async {
+    final result = await _webRTCManager.captureAndProtect(durationSeconds: 3);
+    if (result == null && mounted) {
+      setState(() {
+        _vcStatus = VocalCryptStatus.error;
+        _vcMessage = 'VocalCrypt를 지원하지 않는 환경입니다';
+      });
+    }
   }
 
   // ── 발신 흐름 ───────────────────────────────────────────────────────────
@@ -419,15 +442,12 @@ class _CallScreenState extends State<CallScreen>
       ),
       body: SingleChildScrollView(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              _buildServerCard(),
-              const SizedBox(height: 28),
               const ProfileCircle(),
               if (widget.name.isNotEmpty) ...[
-                const SizedBox(height: 16),
+                const SizedBox(height: 16),if (widget.name.isNotEmpty)
                 Text(
                   widget.name,
                   style: const TextStyle(
@@ -436,8 +456,6 @@ class _CallScreenState extends State<CallScreen>
                     color: Color(0xFF111111),
                   ),
                 ),
-              ],
-              const SizedBox(height: 10),
               Text(
                 _statusMessage,
                 style: const TextStyle(
@@ -472,12 +490,8 @@ class _CallScreenState extends State<CallScreen>
                     ),
                   ),
                 ),
-              const SizedBox(height: 24),
-              _buildWaveContainer(),
               const SizedBox(height: 12),
-              _buildFrequencyInput(),
               if (_callState == CallState.inCall && _latestAudioStats != null) ...[
-                const SizedBox(height: 12),
                 _buildAudioStatsCard(_latestAudioStats!),
               ],
               const SizedBox(height: 24),
@@ -526,7 +540,7 @@ class _CallScreenState extends State<CallScreen>
                   decoration: InputDecoration(
                     hintText: 'ws://10.0.2.2:8080',
                     hintStyle:
-                        const TextStyle(color: Color(0xFFB8B8B8)),
+                    const TextStyle(color: Color(0xFFB8B8B8)),
                     isDense: true,
                     contentPadding: const EdgeInsets.symmetric(
                         horizontal: 12, vertical: 8),
@@ -535,12 +549,12 @@ class _CallScreenState extends State<CallScreen>
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
                       borderSide:
-                          const BorderSide(color: Color(0xFFE0E0E0)),
+                      const BorderSide(color: Color(0xFFE0E0E0)),
                     ),
                     disabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
                       borderSide:
-                          const BorderSide(color: Color(0xFFE0E0E0)),
+                      const BorderSide(color: Color(0xFFE0E0E0)),
                     ),
                   ),
                 ),
@@ -550,7 +564,7 @@ class _CallScreenState extends State<CallScreen>
                 onPressed: _serverConnected
                     ? null
                     : () => _signalingClient
-                        .connect(_serverUrlController.text),
+                    .connect(_serverUrlController.text),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF111111),
                   foregroundColor: Colors.white,
@@ -640,15 +654,15 @@ class _CallScreenState extends State<CallScreen>
       case CallState.idle:
         return _serverConnected
             ? _callButton(
-                label: '발신',
-                icon: Icons.phone,
-                color: const Color(0xFF34C759),
-                onPressed: _startCall,
-              )
+          label: '발신',
+          icon: Icons.phone,
+          color: const Color(0xFF34C759),
+          onPressed: _startCall,
+        )
             : const Text(
-                '서버에 연결 후 통화할 수 있습니다',
-                style: TextStyle(color: Color(0xFF8E8E93)),
-              );
+          '서버에 연결 후 통화할 수 있습니다',
+          style: TextStyle(color: Color(0xFF8E8E93)),
+        );
 
       case CallState.calling:
         return _callButton(
@@ -659,7 +673,7 @@ class _CallScreenState extends State<CallScreen>
         );
 
       case CallState.incomingCall:
-        // Bug #1: 수신 UI — 받기 / 거절
+      // Bug #1: 수신 UI — 받기 / 거절
         return Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
@@ -689,7 +703,7 @@ class _CallScreenState extends State<CallScreen>
         );
 
       case CallState.inCall:
-        // Bug #1: Hang Up 버튼
+      // Bug #1: Hang Up 버튼
         return _callButton(
           label: 'Hang Up',
           icon: Icons.call_end,
@@ -699,14 +713,147 @@ class _CallScreenState extends State<CallScreen>
     }
   }
 
+  // ── VocalCrypt 카드 ─────────────────────────────────────────────────────
+  Widget _buildVocalCryptCard() {
+    final Color color;
+    final Color bgColor;
+    final IconData icon;
+
+    switch (_vcStatus) {
+      case VocalCryptStatus.idle:
+        color = const Color(0xFF8E8E93);
+        bgColor = Colors.white;
+        icon = Icons.shield_outlined;
+      case VocalCryptStatus.recording:
+        color = const Color(0xFFFF9500);
+        bgColor = const Color(0xFFFFF8EE);
+        icon = Icons.mic;
+      case VocalCryptStatus.processing:
+        color = const Color(0xFF007AFF);
+        bgColor = const Color(0xFFEFF6FF);
+        icon = Icons.sync;
+      case VocalCryptStatus.done:
+        color = const Color(0xFF34C759);
+        bgColor = const Color(0xFFF0FFF4);
+        icon = Icons.verified_user;
+      case VocalCryptStatus.error:
+        color = const Color(0xFFFF3B30);
+        bgColor = const Color(0xFFFFF0EF);
+        icon = Icons.error_outline;
+    }
+
+    final bool isRunning = _vcStatus == VocalCryptStatus.recording ||
+        _vcStatus == VocalCryptStatus.processing;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withOpacity(0.35)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color.fromRGBO(0, 0, 0, 0.05),
+            blurRadius: 8,
+            offset: Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 22),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Text(
+                      '딥보이스 보호',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF111111),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: color.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        _vcStatus.name.toUpperCase(),
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: color,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _vcMessage.isNotEmpty
+                      ? _vcMessage
+                      : _vcStatus == VocalCryptStatus.idle
+                      ? '통화 전 음성을 보호하세요'
+                      : _vcStatus == VocalCryptStatus.done
+                      ? '음성 보호 완료'
+                      : '',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF8E8E93),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          if (isRunning)
+            SizedBox(
+              width: 20,
+              height: 20,
+              child:
+              CircularProgressIndicator(strokeWidth: 2, color: color),
+            )
+          else
+            TextButton(
+              onPressed: _serverConnected ? _runVocalCrypt : null,
+              style: TextButton.styleFrom(
+                foregroundColor: color,
+                padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: Text(
+                _vcStatus == VocalCryptStatus.done ? '재보호' : '시작',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: _serverConnected ? color : const Color(0xFFB8B8B8),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildAudioStatsCard(AudioStats stats) {
     final txOk = stats.sentDelta > 0;
     final rxOk = stats.speakerActive;
     final borderColor = stats.isStalled
         ? const Color(0xFFFF3B30)
         : (txOk || rxOk)
-            ? const Color(0xFF34C759)
-            : const Color(0xFFFF9500);
+        ? const Color(0xFF34C759)
+        : const Color(0xFFFF9500);
 
     return Container(
       width: double.infinity,
@@ -795,7 +942,7 @@ class _WavePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
       ..color =
-          isPowerOn ? Colors.black : const Color(0xFFC7C7CC)
+      isPowerOn ? Colors.black : const Color(0xFFC7C7CC)
       ..strokeWidth = isPowerOn ? 3 : 2
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
@@ -823,7 +970,7 @@ class _WavePainter extends CustomPainter {
       for (double x = 0; x <= size.width; x++) {
         final y = size.height / 2 +
             math.sin(
-                    (x / size.width) * math.pi * waveCount + phase) *
+                (x / size.width) * math.pi * waveCount + phase) *
                 amplitude;
         if (x == 0) {
           path.moveTo(x, y);
@@ -839,7 +986,7 @@ class _WavePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _WavePainter oldDelegate) =>
       oldDelegate.isPowerOn != isPowerOn ||
-      oldDelegate.frequency != frequency ||
-      oldDelegate.phase != phase ||
-      oldDelegate.audioLevel != audioLevel;
+          oldDelegate.frequency != frequency ||
+          oldDelegate.phase != phase ||
+          oldDelegate.audioLevel != audioLevel;
 }

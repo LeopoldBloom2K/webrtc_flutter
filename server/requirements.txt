@@ -1,0 +1,13 @@
+# Python 3.11 이상 필요.
+#
+# scipy 1.15.x 는 macOS 27(Golden Gate)에서 기동하지 못한다. _propack 확장의
+# Mach-O 바이너리에 __DATA/__thread_bss 가 zero-fill 인데 offset 이 0 이 아니라
+# dyld 가 거부한다. 1.16.0 부터 고쳐졌고, 1.16 은 Python 3.11 이상을 요구한다.
+#
+# scipy.io 를 안 쓰더라도 scipy.signal 이 scipy.linalg -> scipy.sparse -> _propack
+# 을 끌어오므로 이 제약은 피할 수 없다.
+fastapi>=0.115
+python-multipart>=0.0.9
+numpy>=1.24
+scipy>=1.16
+uvicorn[standard]>=0.30
